@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# datos: nunca subir escaneos ni resultados
+*.las
+*.laz
+*.las2brep.json
+*.3dm
+*.3dmbak
+wheels/

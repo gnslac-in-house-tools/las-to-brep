@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "las2brep"
+version = "0.1.0"
+description = "Nubes de puntos LAS/LAZ -> primitivas ligeras para Breps en Rhino"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "scipy>=1.7", "laspy[lazrs]>=2.4"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+las2brep = "las2brep.__main__:main"
+
+[tool.setuptools]
+packages = ["las2brep"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
