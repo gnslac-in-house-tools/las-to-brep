@@ -7,7 +7,7 @@ __pycache__/
 # datos: nunca subir escaneos ni resultados
 *.las
 *.laz
-*.las2brep.json
+# *.las2brep.json
 *.3dm
 *.3dmbak
 wheels/
