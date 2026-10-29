@@ -97,9 +97,6 @@ def voxelize(
     Cada (voxel, clase) produce un punto: posición y color promedio.
     ``bbox`` = (xmin, ymin, xmax, ymax) en coordenadas originales del LAS.
     """
-    keep = None if keep_classes is None else np.array(sorted(set(keep_classes)), dtype=np.uint8)
-    ignore = np.array(sorted(set(ignore_classes)), dtype=np.uint8)
-
     with laspy.open(path) as f:
         h = f.header
         origin = np.floor(h.mins)
@@ -109,7 +106,7 @@ def voxelize(
                 "La rejilla de voxeles es demasiado grande para este archivo; "
                 "aumenta --voxel o recorta con --bbox."
             )
-        has_rgb = {"red", "green", "blue"} <= set(h.point_format.dimension_names)
+        has_rgb = has_color(h)
         total = int(h.point_count)
 
         keys = np.empty(0, dtype=np.int64)
@@ -118,27 +115,10 @@ def voxelize(
         rgb_max = 0
         done = 0
 
-        for pts in f.chunk_iterator(chunk_size):
-            done += len(pts)
-            cls = _classification(pts)
-            x = np.asarray(pts.x)
-            y = np.asarray(pts.y)
-            mask = np.ones(len(cls), dtype=bool)
-            if keep is not None:
-                mask &= np.isin(cls, keep)
-            if len(ignore):
-                mask &= ~np.isin(cls, ignore)
-            if bbox is not None:
-                mask &= (x >= bbox[0]) & (y >= bbox[1]) & (x <= bbox[2]) & (y <= bbox[3])
-            if not mask.any():
-                continue
-
-            p = np.column_stack([x[mask], y[mask], np.asarray(pts.z)[mask]]) - origin
-            c = cls[mask]
+        for done, p, c, rgb in read_chunks(f, origin, chunk_size, keep_classes, ignore_classes, bbox):
             vals = np.zeros((len(p), 6), dtype=np.float64)
             vals[:, :3] = p
-            if has_rgb:
-                rgb = np.column_stack([pts.red[mask], pts.green[mask], pts.blue[mask]])
+            if rgb is not None:
                 rgb_max = max(rgb_max, int(rgb.max()))
                 vals[:, 3:] = rgb
 
@@ -155,10 +135,7 @@ def voxelize(
     xyz = sums[:, :3] / counts[:, None]
     rgb = None
     if has_rgb and len(keys):
-        rgb = sums[:, 3:] / counts[:, None]
-        if rgb_max > 255:  # LAS guarda color en 16 bits
-            rgb = rgb / 257.0
-        rgb = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+        rgb = to_rgb8(sums[:, 3:] / counts[:, None], rgb_max)
     return VoxelCloud(
         xyz=xyz,
         rgb=rgb,
@@ -167,6 +144,48 @@ def voxelize(
         origin=origin,
         source_points=done,
     )
+
+
+def has_color(header) -> bool:
+    return {"red", "green", "blue"} <= set(header.point_format.dimension_names)
+
+
+def read_chunks(f, origin, chunk_size, keep_classes=None, ignore_classes=(), bbox=None):
+    """Recorre un LAS abierto por bloques y aplica los filtros de clase y ``bbox``.
+
+    Por bloque devuelve (puntos leídos hasta ahora, xyz local, clase, rgb o None).
+    Los bloques sin puntos útiles se saltan.
+    """
+    keep = None if keep_classes is None else np.array(sorted(set(keep_classes)), dtype=np.uint8)
+    ignore = np.array(sorted(set(ignore_classes)), dtype=np.uint8)
+    rgb_on = has_color(f.header)
+    done = 0
+    for pts in f.chunk_iterator(chunk_size):
+        done += len(pts)
+        cls = _classification(pts)
+        x = np.asarray(pts.x)
+        y = np.asarray(pts.y)
+        mask = np.ones(len(cls), dtype=bool)
+        if keep is not None:
+            mask &= np.isin(cls, keep)
+        if len(ignore):
+            mask &= ~np.isin(cls, ignore)
+        if bbox is not None:
+            mask &= (x >= bbox[0]) & (y >= bbox[1]) & (x <= bbox[2]) & (y <= bbox[3])
+        if not mask.any():
+            continue
+        p = np.column_stack([x[mask], y[mask], np.asarray(pts.z)[mask]]) - origin
+        rgb = None
+        if rgb_on:
+            rgb = np.column_stack([pts.red[mask], pts.green[mask], pts.blue[mask]])
+        yield done, p, cls[mask], rgb
+
+
+def to_rgb8(rgb, rgb_max) -> np.ndarray:
+    """Promedios de color -> uint8. LAS suele guardar color en 16 bits."""
+    if rgb_max > 255:
+        rgb = rgb / 257.0
+    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
 
 
 def _classification(pts) -> np.ndarray:

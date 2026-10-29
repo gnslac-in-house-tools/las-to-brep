@@ -10,13 +10,17 @@ este archivo y ejecutar. También: _-RunPythonScript "ruta\\las2brep_importer.py
 
 Resultado:
   - Muros y losas -> Brep cerrada (caja) por región detectada.
-  - Terreno       -> superficie NURBS (Brep de una cara), no malla.
+  - Terreno       -> sólido cerrado: superficie NURBS + costados + base plana
+                     (o solo la superficie con TERRAIN_SOLID = False). No malla.
   - Capas LAS2Brep::<Clase>::<tipo> con material de render por capa.
   - Color de objeto = color promedio del escaneo (si el LAS tiene RGB).
+  - Textura del terreno (PNG junto al JSON, modo --terrain): material con la
+    imagen y mapeo planar desde arriba. Se ve en modo Rendered.
 """
 from __future__ import print_function
 
 import json
+import os
 
 import Rhino
 import Rhino.Geometry as rg
@@ -27,6 +31,8 @@ import System.Drawing as sd
 ROOT_LAYER = "LAS2Brep"
 PLACE_AT_SOURCE_COORDS = False  # True = mover a coordenadas reales del LAS
 IMPORT_RESIDUAL_POINTS = True
+TERRAIN_SOLID = True  # False = solo la superficie del terreno, sin costados ni base
+TERRAIN_TEXTURE = True  # usa el PNG de textura si viene con el JSON
 KIND_NAMES = {"muro": "Muros", "losa": "Losas", "inclinado": "Inclinados"}
 FALLBACK_COLORS = [
     (180, 180, 180), (141, 160, 203), (102, 194, 165), (252, 141, 98),
@@ -120,16 +126,80 @@ def plane_brep(p, tol):
     return capped or brep
 
 
-def terrain_brep(t):
+def terrain_brep(t, tol):
+    """Rejilla de alturas -> superficie NURBS y, con TERRAIN_SOLID, sólido cerrado."""
     nx, ny, cell = t["nx"], t["ny"], t["cell"]
-    x0, y0 = t["origin"]
+    x0, y0 = t["origin"]  # centro de la primera celda
     z = t["z"]
     pts = []
     for i in range(nx):  # u = X (lento), v = Y (rápido)
         for j in range(ny):
             pts.append(rg.Point3d(x0 + i * cell, y0 + j * cell, z[i * ny + j]))
     srf = rg.NurbsSurface.CreateFromPoints(pts, nx, ny, min(3, nx - 1), min(3, ny - 1))
-    return srf.ToBrep() if srf else None
+    if srf is None:
+        return None
+    if not TERRAIN_SOLID:
+        return srf.ToBrep()
+    base = t.get("base", min(z) - 5.0)  # JSON de versiones anteriores no traen base
+    solid = close_terrain(srf, base, tol)
+    if solid is None:
+        print("las2brep: no se pudo cerrar el terreno; se importa solo la superficie.")
+        return srf.ToBrep()
+    return solid
+
+
+def close_terrain(srf, base, tol):
+    """Superficie de terreno -> sólido: costados verticales hasta la cota ``base`` y tapa plana."""
+    top = srf.ToBrep()
+    parts = [top]
+    for edge in top.Edges:
+        crv = edge.DuplicateCurve()
+        a, b = crv.PointAtStart, crv.PointAtEnd
+        low = rg.LineCurve(rg.Point3d(a.X, a.Y, base), rg.Point3d(b.X, b.Y, base))
+        side = rg.NurbsSurface.CreateRuledSurface(crv, low)
+        if side is None:
+            return None
+        parts.append(side.ToBrep())
+    u, v = srf.Domain(0), srf.Domain(1)
+    corners = [srf.PointAt(s, r) for s, r in ((u.Min, v.Min), (u.Max, v.Min), (u.Max, v.Max), (u.Min, v.Max))]
+    corners = [rg.Point3d(p.X, p.Y, base) for p in corners]
+    parts.append(rg.Brep.CreateFromCornerPoints(corners[0], corners[1], corners[2], corners[3], tol))
+    joined = rg.Brep.JoinBreps(parts, tol)
+    if not joined or len(joined) != 1 or not joined[0].IsSolid:
+        return None
+    solid = joined[0]
+    if solid.SolidOrientation == rg.BrepSolidOrientation.Inward:
+        solid.Flip()
+    return solid
+
+
+def terrain_material(t, folder, name):
+    """Material con la textura del terreno. Devuelve su índice o -1 si no hay textura."""
+    tex = t.get("texture")
+    if not (TERRAIN_TEXTURE and tex and tex.get("file")):
+        return -1
+    png = os.path.join(folder, tex["file"])
+    if not os.path.exists(png):
+        print("las2brep: no encontré la textura %s; ponla junto al JSON." % png)
+        return -1
+    mat = Rhino.DocObjects.Material()
+    mat.Name = name
+    mat.DiffuseColor = sd.Color.White
+    if not mat.SetBitmapTexture(png):
+        print("las2brep: Rhino no pudo leer la textura", png)
+        return -1
+    return sc.doc.Materials.Add(mat)
+
+
+def map_texture_from_top(obj_id, tex, xf, scale):
+    """Proyecta la imagen desde arriba: cubre exactamente el rectángulo X/Y de la textura."""
+    o = rg.Point3d(tex["origin"][0], tex["origin"][1], 0.0)
+    o.Transform(xf)
+    pl = rg.Plane(o, rg.Vector3d.XAxis, rg.Vector3d.YAxis)
+    w, h = tex["size"]
+    mapping = Rhino.Render.TextureMapping.CreatePlaneMapping(
+        pl, rg.Interval(0, w * scale), rg.Interval(0, h * scale), rg.Interval(-1, 1))
+    return sc.doc.Objects.ModifyTextureMapping(obj_id, 1, mapping)
 
 
 def run(path=None):
@@ -169,15 +239,26 @@ def run(path=None):
             sc.doc.Objects.AddBrep(brep, attrs(li, p.get("color"), info))
             ok += 1
 
+        folder = os.path.dirname(os.path.abspath(path))
         for t in data.get("terrains", []):
             cname = classes.get(str(t["class"]), "Terreno")
             li = layers.get([ROOT_LAYER, cname], color(t.get("color"), t["class"]))
-            brep = terrain_brep(t)
+            brep = terrain_brep(t, tol)
             if brep is None:
                 bad += 1
                 continue
             brep.Transform(xf)
-            sc.doc.Objects.AddBrep(brep, attrs(li, t.get("color"), {"class": cname}))
+            info = {"class": cname}
+            if "mode" in t:
+                info["mode"] = t["mode"]
+            a = attrs(li, t.get("color"), info)
+            mi = terrain_material(t, folder, "LAS2Brep textura " + os.path.basename(path))
+            if mi >= 0:
+                a.MaterialSource = Rhino.DocObjects.ObjectMaterialSource.MaterialFromObject
+                a.MaterialIndex = mi
+            obj_id = sc.doc.Objects.AddBrep(brep, a)
+            if mi >= 0 and not map_texture_from_top(obj_id, t["texture"], xf, scale):
+                print("las2brep: no se pudo asignar el mapeo de la textura.")
             ok += 1
 
         res = data.get("residual")

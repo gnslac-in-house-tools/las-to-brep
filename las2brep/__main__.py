@@ -16,7 +16,7 @@ import numpy as np
 from . import __version__, export
 from .reader import class_name, inspect, voxelize
 from .segment import SegmentOptions, detect_planes
-from .terrain import heightfield
+from .terrain import heightfield, terrain_from_las
 
 
 def _ints(s):
@@ -38,6 +38,8 @@ def cmd_inspect(a):
 def cmd_convert(a):
     t0 = time.time()
     out = a.output or os.path.splitext(a.las)[0] + ".las2brep.json"
+    if a.terrain:
+        return convert_terrain(a, out, t0)
 
     print(f"[1/4] Leyendo y reduciendo a voxeles de {a.voxel} m ...")
     vc = voxelize(
@@ -52,6 +54,9 @@ def cmd_convert(a):
 
     terrain_cls = set(_ints(a.terrain_classes))
     is_terrain = np.isin(vc.cls, list(terrain_cls)) if terrain_cls else np.zeros(len(vc.cls), bool)
+    if terrain_cls and not is_terrain.any():
+        print(f"      Aviso: no hay puntos de clase {a.terrain_classes} (terreno). "
+              "Si el archivo es un terreno sin clasificar, usa --terrain.")
 
     print("[2/4] Terreno ...")
     terrains = []
@@ -105,6 +110,43 @@ def cmd_convert(a):
     print(f"Listo: {len(prims)} planos, {len(terrains)} terrenos, {kb:,.0f} KB en {stats['seconds']} s")
 
 
+def convert_terrain(a, out, t0):
+    """Modo --terrain: toda la nube es una sola superficie de terreno, sin planos."""
+    print("[1/2] Leyendo el terreno ...")
+    origin, t, image = terrain_from_las(
+        a.las,
+        cell=a.terrain_cell,
+        max_cells=a.terrain_max,
+        ground=a.ground,
+        slope=a.ground_slope,
+        window=a.ground_window,
+        texture_px=a.texture,
+        base_depth=a.base,
+        chunk_size=a.chunk,
+        keep_classes=_ints(a.classes) or None,
+        ignore_classes=_ints(a.ignore),
+        bbox=a.bbox,
+    )
+    print(f"      {t['mode']}: rejilla {t['nx']}x{t['ny']} (celda {t['cell']:.2f} m), {t['points']:,} puntos")
+
+    print("[2/2] Escribiendo", out)
+    if image is not None:
+        png = os.path.splitext(out)[0] + ".png"
+        export.write_png(image, png)
+        t["texture"]["file"] = os.path.basename(png)
+        print(f"      textura {image.shape[1]}x{image.shape[0]} px ({t['texture']['px']:g} m/px): {png}")
+    stats = {
+        "las2brep": __version__,
+        "source_points": t["points"],
+        "terrain_mode": t["mode"],
+        "seconds": round(time.time() - t0, 1),
+    }
+    data = export.build(os.path.basename(a.las), origin, [], {}, [t], None, stats)
+    export.write(data, out)
+    kb = os.path.getsize(out) / 1024
+    print(f"Listo: 1 terreno ({t['mode']}), {kb:,.0f} KB en {stats['seconds']} s")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="las2brep", description="LAS/LAZ -> primitivas para Breps de Rhino")
     p.add_argument("--version", action="version", version=__version__)
@@ -135,9 +177,18 @@ def main(argv=None):
     g.add_argument("--wall-thickness", type=float, default=0.15, help="espesor de muros (0 = superficie)")
     g.add_argument("--slab-thickness", type=float, default=0.20, help="espesor de losas (0 = superficie)")
     g = c.add_argument_group("terreno")
+    g.add_argument("--terrain", action="store_true",
+                   help="modo terreno: toda la nube es una sola superficie, sin importar la clase; no detecta planos")
     g.add_argument("--terrain-classes", default="2", help="clases tratadas como terreno (vacío = ninguna)")
     g.add_argument("--terrain-cell", type=float, default=1.0, help="celda de la rejilla en m")
     g.add_argument("--terrain-max", type=int, default=150, help="máx. puntos de control por lado")
+    g.add_argument("--ground", action="store_true", help="con --terrain: solo el suelo (quita edificios y árboles)")
+    g.add_argument("--ground-window", type=float, default=40.0,
+                   help="con --ground: ancho en m del objeto más grande a quitar (default 40)")
+    g.add_argument("--ground-slope", type=float, default=0.2,
+                   help="con --ground: pendiente máx. del suelo, 0.2 = 20%% (súbela en terreno muy inclinado)")
+    g.add_argument("--texture", type=float, default=0.5, help="con --terrain: m por pixel de la textura (0 = sin textura)")
+    g.add_argument("--base", type=float, default=5.0, help="con --terrain: m bajo el punto más bajo para la base del sólido")
     g = c.add_argument_group("referencia")
     g.add_argument("--residual", type=int, default=0, help="exporta N puntos no asignados como nube ligera")
     c.set_defaults(fn=cmd_convert)

@@ -8,6 +8,7 @@ __pycache__/
 *.las
 *.laz
 # *.las2brep.json
+*.las2brep.png
 *.3dm
 *.3dmbak
 wheels/
